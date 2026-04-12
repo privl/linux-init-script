@@ -47,6 +47,7 @@ detect_pkg_manager() {
 ensure_base_tools() {
     local need_curl=0
     local need_vim=0
+    local need_tmux=0
     local pkg_mgr
 
     if ! command -v curl >/dev/null 2>&1; then
@@ -55,9 +56,12 @@ ensure_base_tools() {
     if ! command -v vim >/dev/null 2>&1; then
         need_vim=1
     fi
+    if ! command -v tmux >/dev/null 2>&1; then
+        need_tmux=1
+    fi
 
-    if [ "$need_curl" -eq 0 ] && [ "$need_vim" -eq 0 ]; then
-        echo "curl 和 vim 已安装，跳过"
+    if [ "$need_curl" -eq 0 ] && [ "$need_vim" -eq 0 ] && [ "$need_tmux" -eq 0 ]; then
+        echo "curl、vim 和 tmux 已安装，跳过"
         return
     fi
 
@@ -70,6 +74,7 @@ ensure_base_tools() {
             local pkgs=()
             [ "$need_curl" -eq 1 ] && pkgs+=(curl)
             [ "$need_vim" -eq 1 ] && pkgs+=(vim)
+            [ "$need_tmux" -eq 1 ] && pkgs+=(tmux)
             apt-get install -y "${pkgs[@]}"
             ;;
         dnf)
@@ -78,6 +83,7 @@ ensure_base_tools() {
             if [ "$need_vim" -eq 1 ]; then
                 dnf install -y vim-enhanced || dnf install -y vim
             fi
+            [ "$need_tmux" -eq 1 ] && dnf install -y tmux
             ;;
         yum)
             echo "检测到 yum，正在安装缺失软件..."
@@ -85,6 +91,7 @@ ensure_base_tools() {
             if [ "$need_vim" -eq 1 ]; then
                 yum install -y vim-enhanced || yum install -y vim
             fi
+            [ "$need_tmux" -eq 1 ] && yum install -y tmux
             ;;
         *)
             if [ "$need_curl" -eq 1 ]; then
@@ -93,6 +100,9 @@ ensure_base_tools() {
             fi
             if [ "$need_vim" -eq 1 ]; then
                 echo "警告：系统缺少 vim，且未找到受支持的包管理器，请手动安装" >&2
+            fi
+            if [ "$need_tmux" -eq 1 ]; then
+                echo "警告：系统缺少 tmux，且未找到受支持的包管理器，请手动安装" >&2
             fi
             ;;
     esac
@@ -107,6 +117,12 @@ ensure_base_tools() {
     else
         echo "警告：vim 仍未安装成功，请稍后手动安装" >&2
     fi
+
+    if command -v tmux >/dev/null 2>&1; then
+        echo "tmux 已安装完成"
+    else
+        echo "警告：tmux 仍未安装成功，请稍后手动安装" >&2
+    fi
 }
 
 valid_username() {
@@ -117,7 +133,7 @@ valid_username() {
 }
 
 # ==========================================================
-# 4. 安装 curl / vim（幂等）
+# 4. 安装 curl / vim / tmux（幂等）
 # ==========================================================
 ensure_base_tools
 
@@ -363,7 +379,7 @@ OUTER_EOF
 echo ""
 echo "======================================="
 echo " 系统初始化和环境部署全部完成！"
-echo " ✓ vim  ✓ curl  ✓ mise  ✓ uv  ✓ tldr"
+echo " ✓ vim  ✓ tmux  ✓ curl  ✓ mise  ✓ uv  ✓ tldr"
 echo "======================================="
 echo "正在切换到 $NEW_USER 用户..."
 sleep 1
