@@ -42,7 +42,7 @@ detect_pkg_manager() {
     fi
 }
 
-# 安装缺失的 curl / vim / tmux（幂等）。curl 缺失为致命错误，其余仅警告
+# 安装缺失的 curl / sudo / vim / tmux（幂等）。curl 缺失为致命错误，其余仅警告
 ensure_base_tools() {
     local pkg_mgr vim_pkg pkgs=()
     pkg_mgr="$(detect_pkg_manager)"
@@ -55,11 +55,12 @@ ensure_base_tools() {
     esac
 
     have curl || pkgs+=(curl)
+    have sudo || pkgs+=(sudo)
     have vim  || pkgs+=("$vim_pkg")
     have tmux || pkgs+=(tmux)
 
     if [ ${#pkgs[@]} -eq 0 ]; then
-        echo "curl、vim 和 tmux 已安装，跳过"
+        echo "curl、sudo、vim 和 tmux 已安装，跳过"
         return
     fi
 
@@ -74,8 +75,46 @@ ensure_base_tools() {
     esac
 
     have curl || { echo "错误：缺少 curl，无法继续执行后续 mise 安装流程" >&2; exit 1; }
+    have sudo || echo "警告：sudo 未安装成功，新用户将没有管理员权限，请稍后手动安装" >&2
     have vim  || echo "警告：vim 未安装成功，请稍后手动安装" >&2
     have tmux || echo "警告：tmux 未安装成功，请稍后手动安装" >&2
+}
+
+# 确保 sudoers 已授权指定组（幂等）。优先写 /etc/sudoers.d/ 独立文件，不改主配置
+ensure_sudoers_rule() {
+    local group="$1"
+    local rule="%${group} ALL=(ALL:ALL) ALL"
+    local file="/etc/sudoers.d/init-script-${group}"
+    local tmp
+
+    have sudo || { echo "警告：sudo 未安装，跳过 sudoers 配置" >&2; return; }
+
+    # 主配置已启用该组（如 Debian 的 %sudo、Fedora 的 %wheel）则无需再加
+    if grep -qE "^[[:space:]]*%${group}[[:space:]]" /etc/sudoers 2>/dev/null; then
+        echo "/etc/sudoers 已授权 %${group}，跳过"
+        return
+    fi
+    if [ -f "$file" ] && [ "$(cat "$file")" = "$rule" ]; then
+        echo "$file 已存在，跳过"
+        return
+    fi
+    if ! grep -qE '^[@#]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers 2>/dev/null; then
+        echo "警告：/etc/sudoers 未包含 /etc/sudoers.d，无法自动授权 %${group}，请手动 visudo" >&2
+        return
+    fi
+
+    tmp="$(mktemp)"
+    printf '%s\n' "$rule" > "$tmp"
+    # 先用 visudo 校验语法，避免写坏 sudoers 导致 sudo 整体失效
+    if ! visudo -cf "$tmp" >/dev/null; then
+        rm -f "$tmp"
+        echo "错误：sudoers 规则校验失败，未写入" >&2
+        exit 1
+    fi
+    install -d -m 0750 /etc/sudoers.d
+    install -m 0440 -o root -g root "$tmp" "$file"
+    rm -f "$tmp"
+    echo "已写入 $file：$rule"
 }
 
 valid_username() {
@@ -133,7 +172,7 @@ validate_existing_user() {
 status_mark() { have "$1" && echo "✓" || echo "✗"; }
 
 # ==========================================================
-# 4. 安装 curl / vim / tmux（幂等）
+# 4. 安装 curl / sudo / vim / tmux（幂等）
 # ==========================================================
 ensure_base_tools
 
@@ -166,11 +205,12 @@ else
     set_password_interactive "$NEW_USER"
 fi
 
-# ---- 加入管理员组（Debian 系为 sudo，RHEL/Arch 为 wheel）；usermod -aG 本身幂等 ----
+# ---- 管理员权限：加入 sudo/wheel 组（usermod -aG 幂等）+ 确保 sudoers 授权该组 ----
 ADMIN_GROUP="$(getent group sudo wheel | head -n1 | cut -d: -f1 || true)"
 if [ -n "$ADMIN_GROUP" ]; then
     usermod -aG "$ADMIN_GROUP" "$NEW_USER"
     echo "已确保 $NEW_USER 属于 $ADMIN_GROUP 组"
+    ensure_sudoers_rule "$ADMIN_GROUP"
 else
     echo "警告：未找到 sudo 或 wheel 组，可能需要手动赋予管理员权限"
 fi
@@ -287,9 +327,9 @@ OUTER_EOF
 echo ""
 echo "======================================="
 echo " 系统初始化和环境部署完成！"
-# curl/mise/uv 缺失会直接中止脚本，能走到这里必然存在；vim/tmux 只是警告，需如实反映
-echo " $(status_mark vim) vim  $(status_mark tmux) tmux  ✓ curl  ✓ mise  ✓ uv  ✓ tldr"
-have vim && have tmux || echo " (✗ 项未安装成功，请稍后手动安装)"
+# curl/mise/uv 缺失会直接中止脚本，能走到这里必然存在；sudo/vim/tmux 只是警告，需如实反映
+echo " $(status_mark sudo) sudo  $(status_mark vim) vim  $(status_mark tmux) tmux  ✓ curl  ✓ mise  ✓ uv  ✓ tldr"
+have sudo && have vim && have tmux || echo " (✗ 项未安装成功，请稍后手动安装)"
 echo "======================================="
 echo "正在切换到 $NEW_USER 用户..."
 
