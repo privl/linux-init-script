@@ -32,97 +32,50 @@ fi
 # ==========================================================
 # 3. 工具函数
 # ==========================================================
+have() { command -v "$1" >/dev/null 2>&1; }
+
 detect_pkg_manager() {
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "apt"
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "dnf"
-    elif command -v yum >/dev/null 2>&1; then
-        echo "yum"
-    else
-        echo "none"
+    if have apt-get; then echo apt
+    elif have dnf; then echo dnf
+    elif have pacman; then echo pacman
+    else echo none
     fi
 }
 
+# 安装缺失的 curl / vim / tmux（幂等）。curl 缺失为致命错误，其余仅警告
 ensure_base_tools() {
-    local need_curl=0
-    local need_vim=0
-    local need_tmux=0
-    local pkg_mgr
+    local pkg_mgr vim_pkg pkgs=()
+    pkg_mgr="$(detect_pkg_manager)"
 
-    if ! command -v curl >/dev/null 2>&1; then
-        need_curl=1
-    fi
-    if ! command -v vim >/dev/null 2>&1; then
-        need_vim=1
-    fi
-    if ! command -v tmux >/dev/null 2>&1; then
-        need_tmux=1
-    fi
+    # 各发行版中"完整功能、无 GUI"的 vim 包名不同
+    case "$pkg_mgr" in
+        apt) vim_pkg=vim-nox ;;
+        dnf) vim_pkg=vim-enhanced ;;
+        *)   vim_pkg=vim ;;
+    esac
 
-    if [ "$need_curl" -eq 0 ] && [ "$need_vim" -eq 0 ] && [ "$need_tmux" -eq 0 ]; then
+    have curl || pkgs+=(curl)
+    have vim  || pkgs+=("$vim_pkg")
+    have tmux || pkgs+=(tmux)
+
+    if [ ${#pkgs[@]} -eq 0 ]; then
         echo "curl、vim 和 tmux 已安装，跳过"
         return
     fi
 
-    pkg_mgr="$(detect_pkg_manager)"
-
+    echo "缺失软件：${pkgs[*]}"
     case "$pkg_mgr" in
-        apt)
-            echo "检测到 apt-get，正在安装缺失软件..."
-            apt-get update
-            local pkgs=()
-            [ "$need_curl" -eq 1 ] && pkgs+=(curl)
-            [ "$need_vim" -eq 1 ] && pkgs+=(vim)
-            [ "$need_tmux" -eq 1 ] && pkgs+=(tmux)
-            apt-get install -y "${pkgs[@]}"
-            ;;
-        dnf)
-            echo "检测到 dnf，正在安装缺失软件..."
-            [ "$need_curl" -eq 1 ] && dnf install -y curl
-            if [ "$need_vim" -eq 1 ]; then
-                dnf install -y vim-enhanced || dnf install -y vim
-            fi
-            [ "$need_tmux" -eq 1 ] && dnf install -y tmux
-            ;;
-        yum)
-            echo "检测到 yum，正在安装缺失软件..."
-            [ "$need_curl" -eq 1 ] && yum install -y curl
-            if [ "$need_vim" -eq 1 ]; then
-                yum install -y vim-enhanced || yum install -y vim
-            fi
-            [ "$need_tmux" -eq 1 ] && yum install -y tmux
-            ;;
-        *)
-            if [ "$need_curl" -eq 1 ]; then
-                echo "错误：系统缺少 curl，且未找到受支持的包管理器，无法继续执行" >&2
-                exit 1
-            fi
-            if [ "$need_vim" -eq 1 ]; then
-                echo "警告：系统缺少 vim，且未找到受支持的包管理器，请手动安装" >&2
-            fi
-            if [ "$need_tmux" -eq 1 ]; then
-                echo "警告：系统缺少 tmux，且未找到受支持的包管理器，请手动安装" >&2
-            fi
-            ;;
+        apt)    apt-get update
+                apt-get install -y "${pkgs[@]}" ;;
+        dnf)    dnf install -y "${pkgs[@]}" ;;
+        # Arch 不支持部分升级（-Sy 后直接装包可能撞库），按官方建议用 -Syu
+        pacman) pacman -Syu --needed --noconfirm "${pkgs[@]}" ;;
+        *)      echo "警告：未找到受支持的包管理器（apt/dnf/pacman），无法自动安装" >&2 ;;
     esac
 
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "错误：curl 安装失败，无法继续执行后续 mise 安装流程" >&2
-        exit 1
-    fi
-
-    if command -v vim >/dev/null 2>&1; then
-        echo "vim 已安装完成"
-    else
-        echo "警告：vim 仍未安装成功，请稍后手动安装" >&2
-    fi
-
-    if command -v tmux >/dev/null 2>&1; then
-        echo "tmux 已安装完成"
-    else
-        echo "警告：tmux 仍未安装成功，请稍后手动安装" >&2
-    fi
+    have curl || { echo "错误：缺少 curl，无法继续执行后续 mise 安装流程" >&2; exit 1; }
+    have vim  || echo "警告：vim 未安装成功，请稍后手动安装" >&2
+    have tmux || echo "警告：tmux 未安装成功，请稍后手动安装" >&2
 }
 
 valid_username() {
@@ -131,6 +84,53 @@ valid_username() {
     [[ "$name" != "root" ]] &&
     [[ "${#name}" -le 32 ]]
 }
+
+# 交互式设置密码，失败则重试（until 的条件不受 set -e 影响）
+set_password_interactive() {
+    echo "请为 $1 设置密码："
+    until passwd "$1" < /dev/tty; do
+        echo "密码设置失败，请重新输入！"
+    done
+}
+
+# 是否已有可用密码。passwd -S 第二列：P/PS = 可用，L/LK = 锁定，NP = 无密码
+has_usable_password() {
+    [[ "$(passwd -S "$1" 2>/dev/null | awk '{print $2}')" == P* ]]
+}
+
+# 校验已存在用户是否适合配置：必须是普通用户、有可登录 shell、有家目录
+validate_existing_user() {
+    local user="$1" entry uid uid_min home shell
+    # 先抓输出再 read：让 IFS=: 只作用于 read，不泄漏给 getent
+    entry="$(getent passwd "$user")"
+    IFS=: read -r _ _ uid _ _ home shell <<< "$entry"
+    uid_min="$(awk '$1=="UID_MIN"{print $2}' /etc/login.defs 2>/dev/null || true)"
+    uid_min="${uid_min:-1000}"
+
+    if [ "$uid" -lt "$uid_min" ]; then
+        echo "错误：$user 是系统账号（UID $uid < $uid_min），拒绝为其配置环境或授予 sudo 权限" >&2
+        exit 1
+    fi
+
+    case "$shell" in
+        */nologin|*/false|"")
+            echo "错误：$user 的登录 shell 为 '${shell:-空}'，无法登录，拒绝配置" >&2
+            exit 1 ;;
+    esac
+    if [ -f /etc/shells ] && ! grep -qxF "$shell" /etc/shells; then
+        echo "错误：$user 的登录 shell '$shell' 不在 /etc/shells 中，拒绝配置" >&2
+        exit 1
+    fi
+    [[ "$shell" == */bash ]] || echo "警告：$user 的登录 shell 是 $shell 而非 bash，本脚本写入的 .bashrc 在该 shell 下不会生效" >&2
+
+    if [ ! -d "$home" ]; then
+        echo "错误：$user 的家目录 '${home:-空}' 不存在，拒绝配置" >&2
+        exit 1
+    fi
+}
+
+# 结尾汇总用：命令存在则 ✓，否则 ✗
+status_mark() { have "$1" && echo "✓" || echo "✗"; }
 
 # ==========================================================
 # 4. 安装 curl / vim / tmux（幂等）
@@ -141,53 +141,36 @@ ensure_base_tools
 # 5. 新建并配置普通用户（幂等：用户已存在则跳过创建）
 # ==========================================================
 echo ""
-NEW_USER=""
 while true; do
     read -r -p "请输入要新建的普通用户名称: " NEW_USER < /dev/tty
-
-    if ! valid_username "$NEW_USER"; then
-        echo "用户名不合法。"
-        echo "要求："
-        echo "  - 只能包含小写字母、数字、下划线、短横线"
-        echo "  - 必须以小写字母或下划线开头"
-        echo "  - 不能是 root"
-        echo "  - 最长 32 个字符"
-        echo ""
-        continue
-    fi
-
-    break
+    valid_username "$NEW_USER" && break
+    echo "用户名不合法。"
+    echo "要求："
+    echo "  - 只能包含小写字母、数字、下划线、短横线"
+    echo "  - 必须以小写字母或下划线开头"
+    echo "  - 不能是 root"
+    echo "  - 最长 32 个字符"
+    echo ""
 done
 
 if id "$NEW_USER" >/dev/null 2>&1; then
+    validate_existing_user "$NEW_USER"
     echo "用户 $NEW_USER 已存在，将直接对其进行环境配置"
+    # 上次运行若在 passwd 阶段中断，用户会处于"已创建但密码锁定"状态，这里补救
+    if ! has_usable_password "$NEW_USER"; then
+        echo "检测到 $NEW_USER 尚未设置可用密码（可能是上次运行中断）"
+        set_password_interactive "$NEW_USER"
+    fi
 else
     useradd -m -s /bin/bash "$NEW_USER"
-    echo "请为 $NEW_USER 设置密码："
-
-    # 临时关闭 set -e，并循环重试，防止密码设置失败导致脚本中断
-    set +e
-    while true; do
-        passwd "$NEW_USER" < /dev/tty
-        if [ $? -eq 0 ]; then
-            break
-        fi
-        echo "密码设置失败，请重新输入！"
-    done
-    set -e
+    set_password_interactive "$NEW_USER"
 fi
 
-# ---- 确保 sudo / wheel 组 ----
-if getent group sudo >/dev/null 2>&1; then
-    if ! id -nG "$NEW_USER" | grep -qw sudo; then
-        usermod -aG sudo "$NEW_USER"
-        echo "已将 $NEW_USER 加入 sudo 组"
-    fi
-elif getent group wheel >/dev/null 2>&1; then
-    if ! id -nG "$NEW_USER" | grep -qw wheel; then
-        usermod -aG wheel "$NEW_USER"
-        echo "已将 $NEW_USER 加入 wheel 组"
-    fi
+# ---- 加入管理员组（Debian 系为 sudo，RHEL/Arch 为 wheel）；usermod -aG 本身幂等 ----
+ADMIN_GROUP="$(getent group sudo wheel | head -n1 | cut -d: -f1 || true)"
+if [ -n "$ADMIN_GROUP" ]; then
+    usermod -aG "$ADMIN_GROUP" "$NEW_USER"
+    echo "已确保 $NEW_USER 属于 $ADMIN_GROUP 组"
 else
     echo "警告：未找到 sudo 或 wheel 组，可能需要手动赋予管理员权限"
 fi
@@ -202,86 +185,29 @@ set -euo pipefail
 
 MARKER="$1"
 
-EARLY_PATH_BEGIN="${MARKER} BEGIN early-path"
-EARLY_PATH_END="${MARKER} END early-path"
+have() { command -v "$1" >/dev/null 2>&1; }
 
-MISE_BEGIN="${MARKER} BEGIN bashrc-mise"
-MISE_END="${MARKER} END bashrc-mise"
-
-ALIAS_BEGIN="${MARKER} BEGIN bashrc-aliases"
-ALIAS_END="${MARKER} END bashrc-aliases"
-
-pick_login_file() {
-    if [ -f "$HOME/.bash_profile" ]; then
-        printf '%s\n' "$HOME/.bash_profile"
-    elif [ -f "$HOME/.bash_login" ]; then
-        printf '%s\n' "$HOME/.bash_login"
-    else
-        printf '%s\n' "$HOME/.profile"
-    fi
-}
-
+# 向文件追加一个带 marker 的托管块（幂等：已存在则跳过）
 append_managed_block_once() {
-    local file="$1"
-    local begin_marker="$2"
-    local end_marker="$3"
-    local body="$4"
+    local file="$1" name="$2" body="$3"
+    local begin="${MARKER} BEGIN ${name}"
+    local end="${MARKER} END ${name}"
 
     touch "$file"
-
-    if grep -qF "$begin_marker" "$file"; then
-        echo "$file 中的托管块已存在，跳过"
+    if grep -qF "$begin" "$file"; then
+        echo "$file 中的托管块 $name 已存在，跳过"
         return
     fi
-
-    {
-        printf '\n%s\n' "$begin_marker"
-        printf '%s\n' "$body"
-        printf '%s\n' "$end_marker"
-    } >> "$file"
-
-    echo "已追加托管块到 $file"
+    printf '\n%s\n%s\n%s\n' "$begin" "$body" "$end" >> "$file"
+    echo "已追加托管块 $name 到 $file"
 }
 
-prepend_managed_block_once() {
-    local file="$1"
-    local begin_marker="$2"
-    local end_marker="$3"
-    local body="$4"
-    local tmp_file
-
-    touch "$file"
-
-    if grep -qF "$begin_marker" "$file"; then
-        echo "$file 中的托管块已存在，跳过"
-        return
-    fi
-
-    tmp_file="$(mktemp)"
-    
-    # 设置陷阱（trap），在函数返回/退出时自动清理临时文件
-    trap 'rm -f "$tmp_file"' RETURN
-
-    {
-        printf '%s\n' "$begin_marker"
-        printf '%s\n' "$body"
-        printf '%s\n\n' "$end_marker"
-        cat "$file"
-    } > "$tmp_file"
-
-    cat "$tmp_file" > "$file"
-
-    echo "已在 $file 顶部插入托管块"
+# 非交互 shell 没有 prompt 钩子，`mise activate` 装完工具后不会刷新 PATH；
+# 这里直接用 `mise env` 导出已配置工具的 PATH，每次装完工具后重新调用
+refresh_mise_env() {
+    eval "$(mise env -s bash)"
+    hash -r
 }
-
-EARLY_PATH_BLOCK=$(cat <<'EOF'
-# 提前准备 PATH，避免 login shell 在读取 .bashrc 前找不到 mise
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) export PATH="$HOME/.local/bin:$PATH" ;;
-esac
-EOF
-)
 
 MISE_BLOCK=$(cat <<'EOF'
 # mise 环境
@@ -305,12 +231,8 @@ EOF
 )
 
 # ----------------------------------------------------------
-# 6a. 在 login 文件顶部插入 early PATH（安全，不重排原结构）
+# 6a. 当前 shell 先补 PATH（mise 安装到 ~/.local/bin）
 # ----------------------------------------------------------
-LOGIN_FILE="$(pick_login_file)"
-prepend_managed_block_once "$LOGIN_FILE" "$EARLY_PATH_BEGIN" "$EARLY_PATH_END" "$EARLY_PATH_BLOCK"
-
-# 当前 shell 也先补 PATH，避免后续安装时 command not found
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
   *) export PATH="$HOME/.local/bin:$PATH" ;;
@@ -319,55 +241,41 @@ esac
 # ----------------------------------------------------------
 # 6b. 安装 mise（幂等：已有则跳过下载）
 # ----------------------------------------------------------
-if command -v mise >/dev/null 2>&1; then
+if have mise; then
     echo "mise 已安装，跳过下载"
 else
     echo "正在下载并安装 mise..."
     curl --connect-timeout 10 --max-time 60 -fsSL https://mise.run | sh
-fi
-
-if ! command -v mise >/dev/null 2>&1; then
-    echo "错误：mise 安装失败！" >&2
-    exit 1
+    have mise || { echo "错误：mise 安装失败！" >&2; exit 1; }
 fi
 
 # ----------------------------------------------------------
-# 6c. 配置 .bashrc - mise 激活（块级 marker）
+# 6c. 配置 .bashrc（块级 marker，幂等）
 # ----------------------------------------------------------
-BASHRC_FILE="$HOME/.bashrc"
-touch "$BASHRC_FILE"
-
-append_managed_block_once "$BASHRC_FILE" "$MISE_BEGIN" "$MISE_END" "$MISE_BLOCK"
-append_managed_block_once "$BASHRC_FILE" "$ALIAS_BEGIN" "$ALIAS_END" "$ALIAS_BLOCK"
-
-# 让当前 shell 立即生效
-eval "$(mise activate bash)"
+append_managed_block_once "$HOME/.bashrc" bashrc-mise "$MISE_BLOCK"
+append_managed_block_once "$HOME/.bashrc" bashrc-aliases "$ALIAS_BLOCK"
+refresh_mise_env
 
 # ----------------------------------------------------------
 # 6d. 使用 mise 安装 uv（幂等：已安装则跳过）
 # ----------------------------------------------------------
-if command -v uv >/dev/null 2>&1; then
+if have uv; then
     echo "uv 已安装 ($(uv --version))，跳过"
 else
     echo "使用 mise 安装 uv..."
     mise use -g uv@latest
-    hash -r
-fi
-
-if ! command -v uv >/dev/null 2>&1; then
-    echo "错误：uv 安装失败！" >&2
-    exit 1
+    refresh_mise_env
+    have uv || { echo "错误：uv 安装失败！" >&2; exit 1; }
 fi
 
 # ----------------------------------------------------------
 # 6e. 使用 uv 安装 tldr（幂等：已安装则跳过）
 # ----------------------------------------------------------
-if command -v tldr >/dev/null 2>&1; then
+if have tldr; then
     echo "tldr 已安装，跳过"
 else
     echo "使用 uv 安装 tldr..."
     uv tool install tldr
-    hash -r
 fi
 
 echo "环境依赖和别名配置完成！"
@@ -378,10 +286,11 @@ OUTER_EOF
 # ==========================================================
 echo ""
 echo "======================================="
-echo " 系统初始化和环境部署全部完成！"
-echo " ✓ vim  ✓ tmux  ✓ curl  ✓ mise  ✓ uv  ✓ tldr"
+echo " 系统初始化和环境部署完成！"
+# curl/mise/uv 缺失会直接中止脚本，能走到这里必然存在；vim/tmux 只是警告，需如实反映
+echo " $(status_mark vim) vim  $(status_mark tmux) tmux  ✓ curl  ✓ mise  ✓ uv  ✓ tldr"
+have vim && have tmux || echo " (✗ 项未安装成功，请稍后手动安装)"
 echo "======================================="
 echo "正在切换到 $NEW_USER 用户..."
-sleep 1
 
 exec su - "$NEW_USER"
